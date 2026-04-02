@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from math import lcm
+from typing import Any
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -41,6 +42,7 @@ class KVCacheCoordinator(ABC):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        cachesage_coordinator: "Any | None" = None,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -52,6 +54,7 @@ class KVCacheCoordinator(ABC):
             hash_block_size,
             enable_kv_cache_events,
             metrics_collector,
+            cachesage_coordinator=cachesage_coordinator,
         )
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled

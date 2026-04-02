@@ -126,6 +126,10 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # CacheSage: blast-radius-aware eviction score.
+    # Higher score means more costly to evict. Set by CacheSage coordinator.
+    brae_score: float = 0.0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash

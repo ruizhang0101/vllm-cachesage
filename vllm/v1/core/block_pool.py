@@ -29,6 +29,9 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
+# CacheSage protection class constants (avoids hard dependency).
+_CACHESAGE_P0 = 0  # ProtectionClass.P0.value
+
 
 class BlockHashToBlockMap:
     """
@@ -152,6 +155,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        cachesage_coordinator: Any | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -179,6 +183,11 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        # CacheSage: optional coordinator for blast-radius-aware eviction.
+        # When set, eviction uses BRAE scores instead of LRU, and P0-protected
+        # blocks in the prefix cache are immune to eviction.
+        self._cachesage = cachesage_coordinator
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -321,6 +330,8 @@ class BlockPool:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
+        When CacheSage is enabled, P0-protected cached blocks are skipped
+        during eviction — they are put back and the next candidate is tried.
 
         Args:
             num_blocks: The number of blocks to allocate.
@@ -330,6 +341,9 @@ class BlockPool:
         """
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+
+        if self._cachesage is not None and self.enable_caching:
+            return self._get_new_blocks_brae(num_blocks)
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
@@ -347,6 +361,44 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        return ret
+
+    def _get_new_blocks_brae(self, num_blocks: int) -> list[KVCacheBlock]:
+        """CacheSage: allocate blocks with P0 prefix cache protection.
+
+        When a popped block is cached and P0-protected, skip it by putting
+        it back at the tail and try the next candidate.
+        """
+        ret: list[KVCacheBlock] = []
+        skipped: list[KVCacheBlock] = []
+        max_attempts = self.get_num_free_blocks() + len(skipped)
+        attempts = 0
+
+        while len(ret) < num_blocks and attempts < max_attempts:
+            block = self.free_block_queue.popleft()
+            attempts += 1
+
+            if block.block_hash is not None and self._is_p0_protected(block):
+                # P0-protected cached block — skip it.
+                skipped.append(block)
+                continue
+
+            self._maybe_evict_cached_block(block)
+            assert block.ref_cnt == 0
+            block.ref_cnt += 1
+            if self.metrics_collector:
+                self.metrics_collector.on_block_allocated(block)
+            ret.append(block)
+
+        # Put skipped P0 blocks back into the free queue.
+        if skipped:
+            self.free_block_queue.append_n(skipped)
+
+        if len(ret) < num_blocks:
+            raise ValueError(
+                f"Cannot allocate {num_blocks} blocks: only {len(ret)} "
+                f"non-P0 free blocks available"
+            )
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -389,6 +441,13 @@ class BlockPool:
             )
         return True
 
+    def _is_p0_protected(self, block: KVCacheBlock) -> bool:
+        """CacheSage: check if a block's cached prefix is P0-protected."""
+        if self._cachesage is None or block.block_hash is None:
+            return False
+        protection = self._cachesage.get_protection(str(block.block_hash))
+        return protection.value == _CACHESAGE_P0
+
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
         the block from the free queue. This is used when a block is hit by
@@ -410,6 +469,9 @@ class BlockPool:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
+        When CacheSage is enabled, blocks are re-ordered by BRAE score
+        (ascending) so that lowest-value blocks are evicted first.
+
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
@@ -418,9 +480,49 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+        free_blocks = [
+            block for block in blocks_list
+            if block.ref_cnt == 0 and not block.is_null
+        ]
+
+        if self._cachesage is not None and free_blocks:
+            # CacheSage: re-order by BRAE score ascending (lowest score
+            # = best eviction candidate = appended first = evicted first).
+            self._update_brae_scores(free_blocks)
+            free_blocks.sort(key=lambda b: b.brae_score)
+
+        self.free_block_queue.append_n(free_blocks)
+
+    def _update_brae_scores(self, blocks: list[KVCacheBlock]) -> None:
+        """CacheSage: update BRAE scores on blocks from the coordinator."""
+        for block in blocks:
+            if block.block_hash is not None:
+                block.brae_score = self._cachesage.score_block(
+                    str(block.block_hash)
+                )
+            else:
+                block.brae_score = 0.0
+
+    def refresh_brae_scores(self) -> None:
+        """CacheSage: re-score all free blocks and re-order the free queue.
+
+        Call this on phase transitions when protection classes change
+        (e.g., BRANCH_PRUNE demotes P0→P2).
+        """
+        if self._cachesage is None:
+            return
+        # Drain the free queue, re-score, re-sort, and re-insert.
+        free_blocks = self.free_block_queue.get_all_free_blocks()
+        if not free_blocks:
+            return
+        # Remove all from queue.
+        for block in free_blocks:
+            self.free_block_queue.remove(block)
+        # Re-score and re-sort.
+        self._update_brae_scores(free_blocks)
+        free_blocks.sort(key=lambda b: b.brae_score)
+        # Re-insert in new order.
+        self.free_block_queue.append_n(free_blocks)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
