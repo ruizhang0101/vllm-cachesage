@@ -152,6 +152,25 @@ class EngineCore:
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
+        # CacheSage: attach BRAE coordinator to BlockPool if enabled.
+        self._cachesage_coordinator = None
+        if os.environ.get("CACHESAGE_ENABLED") == "1":
+            try:
+                from cachesage.engine.coordinator import CacheCoordinator
+                _alpha = float(os.environ.get("CACHESAGE_ALPHA", "1.0"))
+                _decay = float(os.environ.get("CACHESAGE_DECAY", "0.1"))
+                self._cachesage_coordinator = CacheCoordinator(
+                    alpha=_alpha, decay=_decay)
+                block_pool = self.scheduler.kv_cache_manager.block_pool
+                block_pool._cachesage = self._cachesage_coordinator
+                logger.info(
+                    "CacheSage BRAE eviction enabled "
+                    "(alpha=%s, decay=%s, blocks=%s)",
+                    _alpha, _decay, block_pool.num_gpu_blocks)
+            except ImportError:
+                logger.warning(
+                    "CACHESAGE_ENABLED=1 but cachesage package not found")
+
         mm_registry = MULTIMODAL_REGISTRY
         self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(
             vllm_config

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -189,6 +191,19 @@ class BlockPool:
         # blocks in the prefix cache are immune to eviction.
         self._cachesage = cachesage_coordinator
 
+        # CacheSage: per-hash hit tracking for score computation.
+        # Always initialized — _cachesage may be set after __init__ via
+        # EngineCore patching (block_pool._cachesage = coordinator).
+        self._hash_hit_count: dict[Any, int] = {}
+        self._hash_last_touch: dict[Any, int] = {}
+        self._cachesage_step: int = 0
+        self._cachesage_decay: float = float(
+            os.environ.get("CACHESAGE_DECAY", "0.1")
+        )
+        # Cached P0 threshold — recomputed every N steps, not per call.
+        self._p0_threshold: int = 2
+        self._p0_threshold_step: int = 0
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -278,6 +293,14 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+
+            # CacheSage: initialize hit count for newly cached blocks.
+            if self._cachesage is not None:
+                self._cachesage_step += 1
+                h = block_hash_with_group_id
+                self._hash_hit_count.setdefault(h, 0)
+                self._hash_last_touch[h] = self._cachesage_step
+
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -442,11 +465,20 @@ class BlockPool:
         return True
 
     def _is_p0_protected(self, block: KVCacheBlock) -> bool:
-        """CacheSage: check if a block's cached prefix is P0-protected."""
-        if self._cachesage is None or block.block_hash is None:
-            return False
-        protection = self._cachesage.get_protection(str(block.block_hash))
-        return protection.value == _CACHESAGE_P0
+        """CacheSage: do NOT hard-protect any block.
+
+        Eviction ordering is already handled by BRAE scoring in free_blocks.
+        Hard P0 protection risks engine deadlock when too many blocks are
+        marked unreachable, which is worse than sub-optimal eviction.
+        The score-ordering is sufficient — highest-hit blocks are simply
+        last in the eviction queue, so they survive unless cache is
+        truly saturated.
+        """
+        return False
+
+    def _refresh_p0_threshold(self) -> None:
+        """No-op kept for API compatibility."""
+        pass
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
@@ -464,6 +496,14 @@ class BlockPool:
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+
+            # CacheSage: track cumulative hits per block hash.
+            if self._cachesage is not None and block.block_hash is not None:
+                self._cachesage_step += 1
+                h = block.block_hash
+                self._hash_hit_count[h] = self._hash_hit_count.get(h, 0) + 1
+                self._hash_last_touch[h] = self._cachesage_step
+                self._refresh_p0_threshold()
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
@@ -494,12 +534,23 @@ class BlockPool:
         self.free_block_queue.append_n(free_blocks)
 
     def _update_brae_scores(self, blocks: list[KVCacheBlock]) -> None:
-        """CacheSage: update BRAE scores on blocks from the coordinator."""
+        """CacheSage: compute BRAE scores from prefix cache hit counts.
+
+        Score = hit_count * exp(-decay * age)
+
+        Blocks with more prefix cache hits (shared prefixes like system
+        prompts) score higher and survive eviction longer.  Temporal
+        decay ensures stale blocks eventually get evicted.
+        """
+        step = self._cachesage_step
+        decay = self._cachesage_decay
         for block in blocks:
             if block.block_hash is not None:
-                block.brae_score = self._cachesage.score_block(
-                    str(block.block_hash)
-                )
+                h = block.block_hash
+                hits = self._hash_hit_count.get(h, 0)
+                last = self._hash_last_touch.get(h, 0)
+                age = max(step - last, 0)
+                block.brae_score = hits * math.exp(-decay * age)
             else:
                 block.brae_score = 0.0
 
