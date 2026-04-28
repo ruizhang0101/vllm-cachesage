@@ -152,21 +152,58 @@ class EngineCore:
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
-        # CacheSage: attach BRAE coordinator to BlockPool if enabled.
+        # CacheSage: attach coordinator to BlockPool if enabled.
         self._cachesage_coordinator = None
         if os.environ.get("CACHESAGE_ENABLED") == "1":
             try:
                 from cachesage.engine.coordinator import CacheCoordinator
                 _alpha = float(os.environ.get("CACHESAGE_ALPHA", "1.0"))
                 _decay = float(os.environ.get("CACHESAGE_DECAY", "0.1"))
+                _policy = os.environ.get("CACHESAGE_POLICY", "brae")
+                _predict_k = int(os.environ.get("CACHESAGE_PREDICT_K", "3"))
+                _txn_window = int(
+                    os.environ.get("CACHESAGE_TXN_WINDOW", "8")
+                )
                 self._cachesage_coordinator = CacheCoordinator(
-                    alpha=_alpha, decay=_decay)
+                    alpha=_alpha, decay=_decay, policy=_policy,
+                    predict_k=_predict_k,
+                    transition_window=_txn_window,
+                )
                 block_pool = self.scheduler.kv_cache_manager.block_pool
                 block_pool._cachesage = self._cachesage_coordinator
+                # Policy is also read by block_pool from env; mirror it
+                # onto the attribute so we don't depend on env propagation
+                # to this subprocess.
+                block_pool._cachesage_policy = _policy
                 logger.info(
-                    "CacheSage BRAE eviction enabled "
+                    "CacheSage %s eviction enabled "
                     "(alpha=%s, decay=%s, blocks=%s)",
-                    _alpha, _decay, block_pool.num_gpu_blocks)
+                    _policy.upper(), _alpha, _decay, block_pool.num_gpu_blocks)
+
+                # Also attach to the CPU-offload tier's block pool if
+                # the SimpleCPUOffloadConnector is in use. We share the
+                # coordinator and the _block_to_agent map so CPU-tier
+                # evictions use the same agent-level predictions GPU
+                # learned at ingest.
+                try:
+                    connector = self.scheduler.get_kv_connector()
+                except Exception:
+                    connector = None
+                sched_mgr = getattr(connector, "scheduler_manager", None)
+                cpu_pool = getattr(sched_mgr, "cpu_block_pool", None)
+                if cpu_pool is not None:
+                    cpu_pool._cachesage = self._cachesage_coordinator
+                    cpu_pool._cachesage_policy = _policy
+                    # Share block→agent mapping so CPU-tier scoring uses
+                    # the fingerprints GPU stamped at ingest.
+                    cpu_pool._block_to_agent = block_pool._block_to_agent
+                    # Tier labels for debug output.
+                    block_pool._cachesage_tier = "gpu"
+                    cpu_pool._cachesage_tier = "cpu"
+                    logger.info(
+                        "CacheSage %s eviction also attached to CPU tier "
+                        "(cpu blocks=%s)",
+                        _policy.upper(), cpu_pool.num_gpu_blocks)
             except ImportError:
                 logger.warning(
                     "CACHESAGE_ENABLED=1 but cachesage package not found")
