@@ -306,6 +306,32 @@ class BlockPool:
             block_size: Number of tokens in each block.
             kv_cache_group_id: The id of the KV cache group.
         """
+        # CacheSage: observe agent fingerprint on EVERY request, even when
+        # the prefix is a perfect cache hit (num_cached_blocks ==
+        # num_full_blocks). The early return below skips block-cache
+        # bookkeeping when there's nothing new to insert, but agent
+        # transitions are an event stream — they fire once per request
+        # regardless of cache state. Without this, on workloads with
+        # high prefix-hit rates the coordinator never learns transitions.
+        if (
+            self._cachesage is not None
+            and self._cachesage_policy in ("predictive", "kvflow")
+            and num_cached_blocks >= num_full_blocks
+            and len(request.block_hashes) > self._cachesage_agent_prefix_skip
+        ):
+            skip = self._cachesage_agent_prefix_skip
+            take = self._cachesage_agent_prefix_blocks
+            end = min(len(request.block_hashes), skip + take)
+            prefix = tuple(request.block_hashes[i] for i in range(skip, end))
+            agent_id_hit = str(hash(prefix))
+            is_warmup_hit = getattr(request, "max_tokens", 2) <= 1
+            if (not is_warmup_hit
+                    and agent_id_hit != self._cachesage_last_agent_id):
+                try:
+                    self._cachesage.observe_agent_touch(agent_id_hit)
+                except AttributeError:
+                    pass
+                self._cachesage_last_agent_id = agent_id_hit
         if num_cached_blocks >= num_full_blocks:
             return
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
@@ -328,16 +354,19 @@ class BlockPool:
             [] if self.enable_kv_cache_events else None
         )
 
-        # CacheSage predictive: derive a per-agent fingerprint from a
-        # slice of the request's block_hashes. We skip past the shared
-        # chat-template prefix (e.g. gpt-oss harmony fills ~28 blocks
-        # identically across agents) and take the next N blocks as the
-        # signature. The raw BlockHash is used (not the group-id
+        # CacheSage predictive/kvflow: derive a per-agent fingerprint
+        # from a slice of the request's block_hashes. We skip past the
+        # shared chat-template prefix (e.g. gpt-oss harmony fills ~28
+        # blocks identically across agents) and take the next N blocks
+        # as the signature. The raw BlockHash is used (not the group-id
         # variant) so the fingerprint matches across KV cache groups.
+        # KVFlow uses the same block→agent mapping as predictive — its
+        # only difference is reading the transition graph from a frozen
+        # JSON file rather than learning online.
         agent_id: str | None = None
         if (
             self._cachesage is not None
-            and self._cachesage_policy == "predictive"
+            and self._cachesage_policy in ("predictive", "kvflow")
             and len(block_hashes) > self._cachesage_agent_prefix_skip
         ):
             skip = self._cachesage_agent_prefix_skip
@@ -437,12 +466,15 @@ class BlockPool:
                     h = block_hash_with_group_id
                     self._hash_hit_count.setdefault(h, 0)
                     self._hash_last_touch[h] = self._cachesage_step
-                    # Predictive: attribute this block to the request's
-                    # agent. We no longer call observe_block_touch —
-                    # agent-level transitions are the signal that
-                    # concentrates probability mass sufficiently to win
-                    # against recency.
-                    if self._cachesage_policy == "predictive" and agent_id:
+                    # Predictive/KVFlow: attribute this block to the
+                    # request's agent. Both policies need block→agent for
+                    # the agent-survival lookup in _update_brae_scores;
+                    # they differ only in whether transitions are learned
+                    # online (predictive) or read from a frozen graph
+                    # (kvflow). Without this mapping the kvflow score
+                    # collapses to recency = LRU.
+                    if (self._cachesage_policy in ("predictive", "kvflow")
+                            and agent_id):
                         self._block_to_agent[h] = agent_id
 
                 if new_hashes is not None:
@@ -731,7 +763,7 @@ class BlockPool:
     def _update_brae_scores(self, blocks: list[KVCacheBlock]) -> None:
         """CacheSage: compute eviction scores.
 
-        Two policies, selected by CACHESAGE_POLICY env var:
+        Three policies, selected by CACHESAGE_POLICY env var:
 
         - "brae" (default): score = hit_count * exp(-decay * age)
           Protects frequently-touched blocks like shared system prompts.
@@ -741,10 +773,17 @@ class BlockPool:
           Uses learned block-to-block Markov transitions to predict which
           cached blocks will be touched soon. Conditions on the current
           active state (recent touches), not just past statistics.
+
+        - "kvflow": same scoring path as "predictive" but the agent
+          transition table is loaded from a static JSON file at startup
+          and frozen — no online learning. Mirrors KVFlow's "declared
+          Agent Step Graph" assumption.
         """
         step = self._cachesage_step
         decay = self._cachesage_decay
-        predictive = (self._cachesage_policy == "predictive")
+        # Both predictive and kvflow take the survival-prediction code
+        # path; they differ only in whether transitions are learned.
+        predictive = self._cachesage_policy in ("predictive", "kvflow")
 
         _debug_score = bool(os.environ.get("CACHESAGE_DEBUG_SCORE"))
         if _debug_score:

@@ -504,9 +504,26 @@ if not is_torch_equal_or_newer("2.12.0"):
     import builtins as _builtins
     import pickle
 
-    from torch._dynamo.convert_frame import GraphCaptureOutput
+    try:
+        from torch._dynamo.convert_frame import GraphCaptureOutput
+    except ImportError:
+        # torch 2.9+ renamed GraphCaptureOutput → CaptureOutput.
+        try:
+            from torch._dynamo.convert_frame import (
+                CaptureOutput as GraphCaptureOutput,
+            )
+        except ImportError:
+            GraphCaptureOutput = None
 
-    _original_get_runtime_env = GraphCaptureOutput.get_runtime_env
+    _original_get_runtime_env = (
+        getattr(GraphCaptureOutput, "get_runtime_env", None)
+        if GraphCaptureOutput is not None
+        else None
+    )
+    # torch 2.9+ removed the get_runtime_env method entirely; the
+    # monkeypatch below becomes a no-op.
+    if _original_get_runtime_env is None:
+        GraphCaptureOutput = None
 
     def _safe_builtins_dict(builtins_dict: dict) -> dict:
         """Filter a builtins dict to only picklable entries for serialization."""
@@ -531,4 +548,5 @@ if not is_torch_equal_or_newer("2.12.0"):
                     runtime_env.used_globals[ref] = getattr(_builtins, ref)
         return runtime_env
 
-    GraphCaptureOutput.get_runtime_env = _patched_get_runtime_env
+    if GraphCaptureOutput is not None:
+        GraphCaptureOutput.get_runtime_env = _patched_get_runtime_env

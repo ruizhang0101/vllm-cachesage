@@ -164,11 +164,21 @@ class EngineCore:
                 _txn_window = int(
                     os.environ.get("CACHESAGE_TXN_WINDOW", "8")
                 )
+                _kvflow_graph = os.environ.get("CACHESAGE_KVFLOW_GRAPH")
                 self._cachesage_coordinator = CacheCoordinator(
                     alpha=_alpha, decay=_decay, policy=_policy,
                     predict_k=_predict_k,
                     transition_window=_txn_window,
+                    kvflow_graph_path=_kvflow_graph,
                 )
+                # Stash dump path on the coordinator so shutdown() can find
+                # it even if CACHESAGE_DUMP_GRAPH didn't propagate to the
+                # EngineCore subprocess via vLLM's multiprocessing spawn.
+                _dump_path = os.environ.get("CACHESAGE_DUMP_GRAPH")
+                if _dump_path:
+                    self._cachesage_coordinator._dump_path = _dump_path
+                    logger.info("CacheSage will dump graph to %s on shutdown",
+                                _dump_path)
                 block_pool = self.scheduler.kv_cache_manager.block_pool
                 block_pool._cachesage = self._cachesage_coordinator
                 # Policy is also read by block_pool from env; mirror it
@@ -603,6 +613,21 @@ class EngineCore:
             self.abort_requests(request_ids)
 
     def shutdown(self):
+        # CacheSage: dump learned transition graph if requested. Used to
+        # snapshot a "fully-warm" graph for KVFlow re-implementation runs.
+        # Prefer the path stashed at init time on the coordinator (survives
+        # multiprocessing spawn boundaries) before falling back to env.
+        dump_path = None
+        if self._cachesage_coordinator is not None:
+            dump_path = getattr(self._cachesage_coordinator, "_dump_path", None)
+        if not dump_path:
+            dump_path = os.environ.get("CACHESAGE_DUMP_GRAPH")
+        if dump_path and self._cachesage_coordinator is not None:
+            try:
+                self._cachesage_coordinator.dump_kvflow_graph(dump_path)
+                logger.info("CacheSage: dumped agent graph to %s", dump_path)
+            except Exception as e:  # noqa: BLE001 — best-effort dump
+                logger.warning("CacheSage dump failed: %s", e)
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1287,6 +1312,20 @@ class EngineCoreProc(EngineCore):
         # Exit when no work remaining
         if not self.has_work():
             logger.info("Shutdown complete")
+            # CacheSage: dump graph here (the EngineCore.shutdown() in
+            # the finally block at line 1200 may not always run before
+            # the worker exits in this v1 EngineCoreProc path; doing it
+            # here on the main shutdown transition is reliable).
+            _coord = getattr(self, "_cachesage_coordinator", None)
+            if _coord is not None:
+                _dp = getattr(_coord, "_dump_path", None) \
+                      or os.environ.get("CACHESAGE_DUMP_GRAPH")
+                if _dp:
+                    try:
+                        _coord.dump_kvflow_graph(_dp)
+                        logger.info("CacheSage: dumped agent graph to %s", _dp)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("CacheSage dump failed: %s", e)
             return False
 
         return True
