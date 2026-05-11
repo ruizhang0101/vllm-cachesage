@@ -315,7 +315,7 @@ class BlockPool:
         # high prefix-hit rates the coordinator never learns transitions.
         if (
             self._cachesage is not None
-            and self._cachesage_policy in ("predictive", "kvflow")
+            and self._cachesage_policy in ("predictive", "kvflow", "kvflow_paper")
             and num_cached_blocks >= num_full_blocks
             and len(request.block_hashes) > self._cachesage_agent_prefix_skip
         ):
@@ -366,7 +366,7 @@ class BlockPool:
         agent_id: str | None = None
         if (
             self._cachesage is not None
-            and self._cachesage_policy in ("predictive", "kvflow")
+            and self._cachesage_policy in ("predictive", "kvflow", "kvflow_paper")
             and len(block_hashes) > self._cachesage_agent_prefix_skip
         ):
             skip = self._cachesage_agent_prefix_skip
@@ -473,7 +473,7 @@ class BlockPool:
                     # online (predictive) or read from a frozen graph
                     # (kvflow). Without this mapping the kvflow score
                     # collapses to recency = LRU.
-                    if (self._cachesage_policy in ("predictive", "kvflow")
+                    if (self._cachesage_policy in ("predictive", "kvflow", "kvflow_paper")
                             and agent_id):
                         self._block_to_agent[h] = agent_id
 
@@ -783,7 +783,7 @@ class BlockPool:
         decay = self._cachesage_decay
         # Both predictive and kvflow take the survival-prediction code
         # path; they differ only in whether transitions are learned.
-        predictive = self._cachesage_policy in ("predictive", "kvflow")
+        predictive = self._cachesage_policy in ("predictive", "kvflow", "kvflow_paper")
 
         _debug_score = bool(os.environ.get("CACHESAGE_DEBUG_SCORE"))
         if _debug_score:
